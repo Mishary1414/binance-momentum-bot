@@ -5,174 +5,126 @@ import urllib.request
 from datetime import datetime, timezone
 
 BASE = "https://api.kraken.com/0/public"
-
-START_BALANCE = 530.0
-RESERVE = 130.0
-MAX_POSITIONS = 3
-MAX_PER_TRADE = 130.0
-STOP_LOSS = 0.025
-TAKE_PROFIT = 0.05
-FEE = 0.001
-
-balance = START_BALANCE
-positions = {}
-closed_trades = 0
-
+WATCHLIST = [
+    "XXBTZUSD", "XETHZUSD", "SOLUSD", "XRPUSD",
+    "ADAUSD", "DOGEUSD", "LINKUSD", "AVAXUSD",
+    "DOTUSD", "LTCUSD", "TRXUSD", "ATOMUSD",
+    "NEARUSD", "UNIUSD", "ETCUSD", "BCHUSD",
+    "AAVEUSD", "FILUSD", "APTUSD", "INJUSD"
+]
 
 def api(path):
-    req = urllib.request.Request(
+    request = urllib.request.Request(
         BASE + path,
-        headers={"User-Agent": "MomentumBot/1.0"}
+        headers={"User-Agent": "MomentumBot/2.0"}
     )
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read())
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.loads(response.read())
 
+def ticker_data(pair):
+    data = api("/Ticker?pair=" + pair)
+    if data.get("error"):
+        raise Exception(data["error"])
+    item = next(iter(data["result"].values()))
+    price = float(item["c"][0])
+    opening = float(item["o"])
+    volume = float(item["v"][1])
+    change = (price / opening - 1) * 100
+    return price, volume, change
 
-def get_candidates():
-    data = api("/Ticker?pair=XXBTZUSD,XETHZUSD,SOLUSD,XRPUSD,ADAUSD,DOGEUSD,LINKUSD,AVAXUSD")
+def analyze(pair):
+    data = api("/OHLC?pair=" + pair + "&interval=5")
     result = data["result"]
-    candidates = []
-
-    for pair, item in result.items():
-        price = float(item["c"][0])
-        volume = float(item["v"][1])
-        change = ((price / float(item["o"])) - 1) * 100
-
-        if volume > 100 and 0.5 < change < 15:
-            candidates.append({
-                "symbol": pair,
-                "price": price,
-                "volume": volume,
-                "change": change
-            })
-
-    return sorted(candidates, key=lambda x: x["volume"], reverse=True)
-
-
-def get_signal(pair):
-    data = api(f"/OHLC?pair={pair}&interval=5")
-    result = data["result"]
-
     key = next(k for k in result if k != "last")
     candles = result[key][:-1]
+
+    if len(candles) < 25:
+        return None
 
     closes = [float(c[4]) for c in candles]
     volumes = [float(c[6]) for c in candles]
 
-    if len(closes) < 25:
-        return None
-
     fast = sum(closes[-9:]) / 9
     slow = sum(closes[-21:]) / 21
+    avg_volume = sum(volumes[-21:-1]) / 20
 
-    average_volume = sum(volumes[-21:-1]) / 20
+    last_volume = volumes[-1]
+    last_price = closes[-1]
 
-    if fast > slow and closes[-1] > fast and volumes[-1] > average_volume * 1.5:
-        return closes[-1]
+    if avg_volume <= 0:
+        return None
 
-    return None
+    volume_ratio = last_volume / avg_volume
+    trend = fast > slow and last_price > fast
 
+    score = 0
+    if trend:
+        score += 40
+    if volume_ratio >= 1.5:
+        score += 35
+    elif volume_ratio >= 1.2:
+        score += 20
+    if last_price > max(closes[-6:-1]):
+        score += 25
 
-def buy(symbol, price):
-    global balance
-
-    if symbol in positions or len(positions) >= MAX_POSITIONS:
-        return
-
-    spend = min(MAX_PER_TRADE, balance - RESERVE)
-
-    if spend <= 0:
-        return
-
-    balance -= spend
-
-    positions[symbol] = {
-        "entry": price,
-        "quantity": spend / price,
-        "invested": spend
+    return {
+        "score": score,
+        "volume_ratio": volume_ratio,
+        "trend": trend,
+        "price": last_price
     }
 
-    print(f"BUY PAPER | {symbol} | Price: {price} | Amount: {spend:.2f}")
-
-
-def sell(symbol, price, reason):
-    global balance, closed_trades
-
-    p = positions[symbol]
-    gross = p["quantity"] * price
-    net = gross * (1 - FEE)
-    cost = p["invested"] * (1 + FEE)
-    profit = net - cost
-
-    balance += net
-    closed_trades += 1
-
-    print(
-        f"SELL PAPER | {symbol} | {reason} | "
-        f"P/L: {profit:.3f} USD | Balance: {balance:.2f}"
-    )
-
-    del positions[symbol]
-
-
-def manage_positions():
-    for symbol in list(positions):
-        try:
-            data = api(f"/Ticker?pair={symbol}")
-            item = next(iter(data["result"].values()))
-            price = float(item["c"][0])
-
-            entry = positions[symbol]["entry"]
-            change = (price - entry) / entry
-
-            if change <= -STOP_LOSS:
-                sell(symbol, price, "STOP LOSS")
-            elif change >= TAKE_PROFIT:
-                sell(symbol, price, "TAKE PROFIT")
-
-        except Exception as e:
-            print("Position error:", symbol, e)
-
-
 def run():
-    print("KRAKEN DATA MOMENTUM BOT STARTED")
-    print("MODE: PAPER TRADING")
-    print("REAL ORDERS: DISABLED")
+    print("MOMENTUM SCANNER 2.0 STARTED")
+    print("MARKET DATA: KRAKEN")
+    print("MODE: ANALYSIS ONLY - NO REAL ORDERS")
 
     while True:
-        try:
-            manage_positions()
-            candidates = get_candidates()
+        rows = []
 
-            for item in candidates:
-                if len(positions) >= MAX_POSITIONS:
-                    break
-
-                symbol = item["symbol"]
-
-                if symbol in positions:
-                    continue
-
-                signal = get_signal(symbol)
+        for pair in WATCHLIST:
+            try:
+                price, volume, change = ticker_data(pair)
+                signal = analyze(pair)
 
                 if signal:
-                    buy(symbol, signal)
+                    rows.append({
+                        "pair": pair,
+                        "price": price,
+                        "volume": volume,
+                        "change": change,
+                        **signal
+                    })
 
                 time.sleep(1)
 
+            except Exception as error:
+                print("PAIR ERROR:", pair, str(error))
+
+        rows.sort(key=lambda x: x["score"], reverse=True)
+
+        print("\n" + "=" * 45)
+        print("TOP 5 MOMENTUM CANDIDATES")
+        print(datetime.now(timezone.utc).isoformat())
+
+        for row in rows[:5]:
             print(
-                f"SCAN COMPLETE | Candidates: {len(candidates)} | "
-                f"Open: {len(positions)} | Closed: {closed_trades} | "
-                f"Cash: {balance:.2f} USD"
+                f"{row['pair']} | Score: {row['score']}/100 | "
+                f"24h: {row['change']:.2f}% | "
+                f"Volume: {row['volume']:.2f} | "
+                f"5m Volume Ratio: {row['volume_ratio']:.2f} | "
+                f"Trend: {row['trend']}"
             )
 
-            time.sleep(60)
-
-        except Exception as e:
-            print("MAIN ERROR:", repr(e))
-            time.sleep(30)
-
+        print("COINS ANALYZED:", len(rows))
+        print("NEXT SCAN IN 60 SECONDS")
+        time.sleep(60)
 
 if __name__ == "__main__":
-    run()
+    while True:
+        try:
+            run()
+        except Exception as error:
+            print("MAIN ERROR:", repr(error))
+            time.sleep(30)
 
